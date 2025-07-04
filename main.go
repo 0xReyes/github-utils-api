@@ -76,7 +76,6 @@ func corsAnywhereHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create new request to target URL
 	req, err := http.NewRequest(r.Method, targetURL, r.Body)
 	if err != nil {
 		log.Printf("create request to %s failed: %v", targetURL, err)
@@ -84,20 +83,17 @@ func corsAnywhereHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// List of headers to forward from client
 	forwardedHeaders := []string{
 		"Content-Type",
 		"Accept",
 	}
 
-	// Copy only allowed headers from original request
 	for _, key := range forwardedHeaders {
 		if value := r.Header.Get(key); value != "" {
 			req.Header.Set(key, value)
 		}
 	}
 
-	// Set Authorization and User-Agent using server credentials
 	token := os.Getenv("GITHUB_TOKEN")
 	if token == "" {
 		http.Error(w, "GITHUB_TOKEN not set", http.StatusInternalServerError)
@@ -106,7 +102,6 @@ func corsAnywhereHandler(w http.ResponseWriter, r *http.Request) {
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("User-Agent", "CORS-Proxy/1.0")
 
-	// Make request to target
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -116,7 +111,6 @@ func corsAnywhereHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	// Copy all response headers from the target, including CORS headers
 	for key, values := range resp.Header {
 		for _, value := range values {
 			w.Header().Add(key, value)
@@ -126,12 +120,10 @@ func corsAnywhereHandler(w http.ResponseWriter, r *http.Request) {
 	// Override Access-Control-Allow-Origin for consistency
 	w.Header().Set("Access-Control-Allow-Origin", "https://0xreyes.github.io")
 
-	// Set Access-Control-Expose-Headers if not already set
 	if w.Header().Get("Access-Control-Expose-Headers") == "" {
 		w.Header().Set("Access-Control-Expose-Headers", "*")
 	}
 
-	// Set response status code
 	w.WriteHeader(resp.StatusCode)
 
 	// Copy response body
