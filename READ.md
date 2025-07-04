@@ -1,6 +1,6 @@
 # CORS Anywhere API (Go)
 
-A lightweight Go-based CORS Anywhere proxy server that forwards HTTP requests to a target URL, adds CORS headers, and supports GitHub API authentication via an environment variable. Browser-injected headers (e.g., `Cookie`, `Referer`) are excluded for cleaner requests.
+A lightweight Go-based GitHub API
 
 ## Setup
 1. Clone the repository:

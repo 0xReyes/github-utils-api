@@ -6,34 +6,28 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"regexp"
 	"strings"
 )
 
 func main() {
 	http.HandleFunc("/", corsAnywhereHandler)
-	log.Println("Starting CORS proxy on :8080")
+
+	log.Println("Starting GitHub IP-Tools restricted proxy on :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
-var allowedPaths = []string{
-	"/repos/0xReyes/ip-tools/actions/artifacts",
-	"/repos/0xReyes/ip-tools/actions/workflows/backend-api-trigger.yml/dispatches",
-}
-
-var runArtifactPattern = regexp.MustCompile(`^/repos/0xReyes/ip-tools/actions/runs/[^/]+/artifacts$`)
-
-func isAllowedPath(path string) bool {
-	for _, p := range allowedPaths {
-		if path == p {
-			return true
-		}
-	}
-	return runArtifactPattern.MatchString(path)
-}
-
 func corsAnywhereHandler(w http.ResponseWriter, r *http.Request) {
-	// Extract target URL from path
+
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Expose-Headers", "*") // Also expose all headers as needed
+
+	if r.Method == "OPTIONS" {
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.WriteHeader(http.StatusNoContent) // 204 No Content
+		return
+	}
+
 	targetURL := r.URL.Path[1:] // Remove leading "/"
 	if targetURL == "" {
 		http.Error(w, "Missing target URL", http.StatusBadRequest)
@@ -41,38 +35,19 @@ func corsAnywhereHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Println("targetURL:", targetURL)
 
-	// Prepend https:// if no scheme is provided
 	if !strings.HasPrefix(targetURL, "http://") && !strings.HasPrefix(targetURL, "https://") {
 		targetURL = "https://" + targetURL
 	}
 
-	// Validate and parse target URL
 	parsedURL, err := url.Parse(targetURL)
 	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
 		http.Error(w, "Invalid target URL", http.StatusBadRequest)
 		return
 	}
 
-	// Restrict to api.github.com and specific endpoints
-	if parsedURL.Host != "api.github.com" || !isAllowedPath(parsedURL.Path) {
-		http.Error(w, "Target URL not allowed", http.StatusForbidden)
-		return
-	}
-
-	// Validate origin
-	origin := r.Header.Get("Origin")
-	if origin != "https://0xreyes.github.io" {
-		http.Error(w, "Unauthorized origin", http.StatusForbidden)
-		return
-	}
-
-	// Handle preflight OPTIONS requests
-	if r.Method == "OPTIONS" {
-		w.Header().Set("Access-Control-Allow-Origin", "https://0xreyes.github.io")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept")
-		w.Header().Set("Access-Control-Max-Age", "86400") // Cache preflight for 24 hours
-		w.WriteHeader(http.StatusNoContent)
+	if !strings.Contains(targetURL, "ip-tools") {
+		log.Printf("Forbidden: Target URL '%s' does not contain 'ip-tools'", targetURL)
+		http.Error(w, "Access to this target is forbidden. URL must contain 'ip-tools'.", http.StatusForbidden)
 		return
 	}
 
@@ -85,7 +60,9 @@ func corsAnywhereHandler(w http.ResponseWriter, r *http.Request) {
 
 	forwardedHeaders := []string{
 		"Content-Type",
+		"Authorization",
 		"Accept",
+		"User-Agent",
 	}
 
 	for _, key := range forwardedHeaders {
@@ -94,13 +71,11 @@ func corsAnywhereHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	token := os.Getenv("GITHUB_TOKEN")
-	if token == "" {
-		http.Error(w, "GITHUB_TOKEN not set", http.StatusInternalServerError)
-		return
+	if strings.Contains(parsedURL.Host, "api.github.com") {
+		if token := os.Getenv("GITHUB_TOKEN"); token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("User-Agent", "CORS-Proxy/1.0")
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
@@ -112,21 +87,17 @@ func corsAnywhereHandler(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	for key, values := range resp.Header {
+
+		if strings.ToLower(key) == "access-control-allow-origin" {
+			continue
+		}
 		for _, value := range values {
 			w.Header().Add(key, value)
 		}
 	}
 
-	// Override Access-Control-Allow-Origin for consistency
-	w.Header().Set("Access-Control-Allow-Origin", "https://0xreyes.github.io")
-
-	if w.Header().Get("Access-Control-Expose-Headers") == "" {
-		w.Header().Set("Access-Control-Expose-Headers", "*")
-	}
-
 	w.WriteHeader(resp.StatusCode)
 
-	// Copy response body
 	if resp.Body != nil && resp.ContentLength != 0 {
 		const maxBodySize = 10 * 1024 * 1024 // 10 MB limit
 		_, err = io.Copy(w, io.LimitReader(resp.Body, maxBodySize))
