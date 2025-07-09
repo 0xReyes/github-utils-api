@@ -1,32 +1,165 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
+	"time"
 )
 
+// Simple in-memory session store
+var sessions = make(map[string]time.Time)
+
+type AuthResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+	Token   string `json:"token,omitempty"`
+}
+
 func main() {
+	http.HandleFunc("/auth/login", loginHandler)
+	http.HandleFunc("/auth/verify", verifyHandler)
 	http.HandleFunc("/", corsAnywhereHandler)
 
-	log.Println("Starting GitHub IP-Tools restricted proxy on :8080")
+	log.Println("Starting authenticated proxy server on :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
-func corsAnywhereHandler(w http.ResponseWriter, r *http.Request) {
+// Generate secure session token
+func generateSessionToken() string {
+	bytes := make([]byte, 32)
+	rand.Read(bytes)
+	return hex.EncodeToString(bytes)
+}
 
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Expose-Headers", "*") // Also expose all headers as needed
+// Set CORS headers
+func setCORSHeaders(w http.ResponseWriter) {
+	// Cannot use wildcard (*) with credentials, must specify exact origin
+	w.Header().Set("Access-Control-Allow-Origin", "https://0x.reyes.github.io")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	w.Header().Set("Access-Control-Allow-Credentials", "true")
+}
+
+// Simple login - just generates a token
+func loginHandler(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
 
 	if r.Method == "OPTIONS" {
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-		w.WriteHeader(http.StatusNoContent) // 204 No Content
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Generate session token
+	token := generateSessionToken()
+
+	// Store session (expires in 24 hours)
+	sessions[token] = time.Now().Add(24 * time.Hour)
+
+	// Set HTTP-only cookie
+	cookie := &http.Cookie{
+		Name:     "auth_token",
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   true,                  // Must be true for cross-origin cookies
+		SameSite: http.SameSiteNoneMode, // Required for cross-origin
+		Expires:  time.Now().Add(24 * time.Hour),
+	}
+	http.SetCookie(w, cookie)
+
+	response := AuthResponse{
+		Success: true,
+		Message: "Authentication successful",
+		Token:   token,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// Verify authentication
+func verifyHandler(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	if isAuthenticated(r) {
+		response := AuthResponse{Success: true, Message: "Authenticated"}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+	} else {
+		response := AuthResponse{Success: false, Message: "Not authenticated"}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(response)
+	}
+}
+
+// Check if request is authenticated
+func isAuthenticated(r *http.Request) bool {
+	// Check cookie first
+	if cookie, err := r.Cookie("auth_token"); err == nil {
+		if expiry, exists := sessions[cookie.Value]; exists && time.Now().Before(expiry) {
+			return true
+		}
+	}
+
+	// Check Authorization header as fallback
+	authHeader := r.Header.Get("Authorization")
+	if authHeader != "" {
+		token := strings.TrimPrefix(authHeader, "Bearer ")
+		if expiry, exists := sessions[token]; exists && time.Now().Before(expiry) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// Clean up expired sessions
+func cleanupSessions() {
+	for token, expiry := range sessions {
+		if time.Now().After(expiry) {
+			delete(sessions, token)
+		}
+	}
+}
+
+// Modified CORS proxy handler with authentication
+func corsAnywhereHandler(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	// Check authentication for all proxy requests
+	if !isAuthenticated(r) {
+		response := AuthResponse{Success: false, Message: "Authentication required"}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(response)
+		return
+	}
+
+	// Clean up expired sessions periodically
+	go cleanupSessions()
 
 	targetURL := r.URL.Path[1:] // Remove leading "/"
 	if targetURL == "" {
@@ -61,7 +194,6 @@ func corsAnywhereHandler(w http.ResponseWriter, r *http.Request) {
 
 	forwardedHeaders := []string{
 		"Content-Type",
-		"Authorization",
 		"Accept",
 		"User-Agent",
 	}
@@ -88,7 +220,6 @@ func corsAnywhereHandler(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	for key, values := range resp.Header {
-
 		if strings.ToLower(key) == "access-control-allow-origin" {
 			continue
 		}
