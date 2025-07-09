@@ -39,9 +39,24 @@ func generateSessionToken() string {
 }
 
 // Set CORS headers
-func setCORSHeaders(w http.ResponseWriter) {
-	// Cannot use wildcard (*) with credentials, must specify exact origin
-	w.Header().Set("Access-Control-Allow-Origin", "https://0x.reyes.github.io")
+func setCORSHeaders(w http.ResponseWriter, r *http.Request) {
+	origin := r.Header.Get("Origin")
+	allowedOrigins := []string{
+		"https://0x.reyes.github.io",
+		"http://localhost:3000",
+		"http://localhost:3001",
+		"http://localhost:8080",
+		"http://127.0.0.1:3000",
+		"http://127.0.0.1:3001",
+		"http://127.0.0.1:8080",
+	}
+
+	for _, allowed := range allowedOrigins {
+		if origin == allowed {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			break
+		}
+	}
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 	w.Header().Set("Access-Control-Allow-Credentials", "true")
@@ -49,7 +64,7 @@ func setCORSHeaders(w http.ResponseWriter) {
 
 // Simple login - just generates a token
 func loginHandler(w http.ResponseWriter, r *http.Request) {
-	setCORSHeaders(w)
+	setCORSHeaders(w, r)
 
 	if r.Method == "OPTIONS" {
 		w.WriteHeader(http.StatusNoContent)
@@ -67,15 +82,23 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	// Store session (expires in 24 hours)
 	sessions[token] = time.Now().Add(24 * time.Hour)
 
-	// Set HTTP-only cookie
+	// Set HTTP-only cookie with different settings for localhost vs production
+	origin := r.Header.Get("Origin")
+	isLocalhost := strings.Contains(origin, "localhost") || strings.Contains(origin, "127.0.0.1")
+
 	cookie := &http.Cookie{
 		Name:     "auth_token",
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   true,                  // Must be true for cross-origin cookies
-		SameSite: http.SameSiteNoneMode, // Required for cross-origin
-		Expires:  time.Now().Add(24 * time.Hour),
+		Secure:   !isLocalhost, // false for localhost, true for production
+		SameSite: func() http.SameSite {
+			if isLocalhost {
+				return http.SameSiteLaxMode
+			}
+			return http.SameSiteNoneMode
+		}(),
+		Expires: time.Now().Add(24 * time.Hour),
 	}
 	http.SetCookie(w, cookie)
 
@@ -91,7 +114,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 
 // Verify authentication
 func verifyHandler(w http.ResponseWriter, r *http.Request) {
-	setCORSHeaders(w)
+	setCORSHeaders(w, r)
 
 	if r.Method == "OPTIONS" {
 		w.WriteHeader(http.StatusNoContent)
@@ -112,22 +135,41 @@ func verifyHandler(w http.ResponseWriter, r *http.Request) {
 
 // Check if request is authenticated
 func isAuthenticated(r *http.Request) bool {
+	// Debug: Log all cookies
+	log.Printf("Request to %s", r.URL.Path)
+	for _, cookie := range r.Cookies() {
+		log.Printf("Cookie: %s = %s", cookie.Name, cookie.Value)
+	}
+
 	// Check cookie first
 	if cookie, err := r.Cookie("auth_token"); err == nil {
+		log.Printf("Found auth_token cookie: %s", cookie.Value)
 		if expiry, exists := sessions[cookie.Value]; exists && time.Now().Before(expiry) {
+			log.Printf("Cookie is valid and not expired")
 			return true
+		} else {
+			log.Printf("Cookie is invalid or expired")
 		}
+	} else {
+		log.Printf("No auth_token cookie found: %v", err)
 	}
 
 	// Check Authorization header as fallback
 	authHeader := r.Header.Get("Authorization")
 	if authHeader != "" {
+		log.Printf("Found Authorization header: %s", authHeader)
 		token := strings.TrimPrefix(authHeader, "Bearer ")
 		if expiry, exists := sessions[token]; exists && time.Now().Before(expiry) {
+			log.Printf("Bearer token is valid and not expired")
 			return true
+		} else {
+			log.Printf("Bearer token is invalid or expired")
 		}
+	} else {
+		log.Printf("No Authorization header found")
 	}
 
+	log.Printf("Authentication failed for request to %s", r.URL.Path)
 	return false
 }
 
@@ -142,7 +184,7 @@ func cleanupSessions() {
 
 // Modified CORS proxy handler with authentication
 func corsAnywhereHandler(w http.ResponseWriter, r *http.Request) {
-	setCORSHeaders(w)
+	setCORSHeaders(w, r)
 
 	if r.Method == "OPTIONS" {
 		w.WriteHeader(http.StatusNoContent)
@@ -179,7 +221,7 @@ func corsAnywhereHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Allow ip-tools URLs or the specific job data repository
-	if !strings.Contains(targetURL, "ip-tools") && !strings.Contains(targetURL, "job-data-warehouse") {
+	if !strings.Contains(targetURL, "ip-tools") && !strings.Contains(targetURL, "github.com/0xReyes/job-data-warehouse") {
 		log.Printf("Forbidden: Target URL '%s' is not allowed", targetURL)
 		http.Error(w, "Access to this target is forbidden.", http.StatusForbidden)
 		return
