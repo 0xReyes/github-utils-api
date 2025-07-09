@@ -45,9 +45,10 @@ func corsAnywhereHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !strings.Contains(targetURL, "ip-tools") {
-		log.Printf("Forbidden: Target URL '%s' does not contain 'ip-tools'", targetURL)
-		http.Error(w, "Access to this target is forbidden. URL must contain 'ip-tools'.", http.StatusForbidden)
+	// Allow ip-tools URLs or the specific job data repository
+	if !strings.Contains(targetURL, "ip-tools") && !strings.Contains(targetURL, "job-data-warehouse") {
+		log.Printf("Forbidden: Target URL '%s' is not allowed", targetURL)
+		http.Error(w, "Access to this target is forbidden.", http.StatusForbidden)
 		return
 	}
 
@@ -71,7 +72,7 @@ func corsAnywhereHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if strings.Contains(parsedURL.Host, "api.github.com") {
+	if strings.Contains(parsedURL.Host, "api.github.com") || strings.Contains(parsedURL.Host, "github.com") || strings.Contains(parsedURL.Host, "raw.githubusercontent.com") {
 		if token := os.Getenv("GITHUB_TOKEN"); token != "" {
 			req.Header.Set("Authorization", "Bearer "+token)
 		}
