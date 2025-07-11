@@ -90,6 +90,38 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	cookie := &http.Cookie{
 		Name:     "auth_token",
 		Value:    token,
+		Domain:   "api.github.com",
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   !isLocalhost, // false for localhost, true for production
+		SameSite: func() http.SameSite {
+			if isLocalhost {
+				return http.SameSiteLaxMode
+			}
+			return http.SameSiteNoneMode
+		}(),
+		Expires: time.Now().Add(24 * time.Hour),
+	}
+
+	cookie2 := &http.Cookie{
+		Name:     "auth_token",
+		Value:    token,
+		Domain:   "raw.githubusercontent.com",
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   !isLocalhost, // false for localhost, true for production
+		SameSite: func() http.SameSite {
+			if isLocalhost {
+				return http.SameSiteLaxMode
+			}
+			return http.SameSiteNoneMode
+		}(),
+		Expires: time.Now().Add(24 * time.Hour),
+	}
+
+	cookie3 := &http.Cookie{
+		Name:     "auth_token",
+		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
 		Secure:   !isLocalhost, // false for localhost, true for production
@@ -102,6 +134,8 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		Expires: time.Now().Add(24 * time.Hour),
 	}
 	http.SetCookie(w, cookie)
+	http.SetCookie(w, cookie2)
+	http.SetCookie(w, cookie3)
 
 	response := AuthResponse{
 		Success: true,
@@ -222,7 +256,7 @@ func corsAnywhereHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Allow ip-tools URLs or the specific job data repository
-	if !strings.Contains(targetURL, "ip-tools") && !strings.Contains(targetURL, "github.com/0xReyes/job-data-warehouse") {
+	if !strings.Contains(targetURL, "ip-tools") && !strings.Contains(targetURL, "job-data-warehouse") {
 		log.Printf("Forbidden: Target URL '%s' is not allowed", targetURL)
 		http.Error(w, "Access to this target is forbidden.", http.StatusForbidden)
 		return
