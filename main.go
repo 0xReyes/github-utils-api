@@ -10,11 +10,13 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
-// Simple in-memory session store
+// Session store with a mutex for thread safety
 var sessions = make(map[string]time.Time)
+var sessionMutex sync.RWMutex
 
 type AuthResponse struct {
 	Success bool   `json:"success"`
@@ -42,7 +44,7 @@ func generateSessionToken() string {
 func setCORSHeaders(w http.ResponseWriter, r *http.Request) {
 	origin := r.Header.Get("Origin")
 	allowedOrigins := []string{
-		"https://0x.reyes.github.io",
+		"https://0xreyes.github.io",
 		"http://localhost:3000",
 		"https://localhost:3000",
 		"http://localhost:3001",
@@ -80,8 +82,10 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	// Generate session token
 	token := generateSessionToken()
 
-	// Store session (expires in 24 hours)
-	sessions[token] = time.Now().Add(24 * time.Hour)
+	// Store session (expires in 24 hours) with thread safety
+	sessionMutex.Lock()
+	sessions[token] = time.Now().Add(48 * time.Hour)
+	sessionMutex.Unlock()
 
 	// Set HTTP-only cookie with different settings for localhost vs production
 	origin := r.Header.Get("Origin")
@@ -179,7 +183,13 @@ func isAuthenticated(r *http.Request) bool {
 	// Check cookie first
 	if cookie, err := r.Cookie("auth_token"); err == nil {
 		log.Printf("Found auth_token cookie: %s", cookie.Value)
-		if expiry, exists := sessions[cookie.Value]; exists && time.Now().Before(expiry) {
+
+		// Use read lock for checking session
+		sessionMutex.RLock()
+		expiry, exists := sessions[cookie.Value]
+		sessionMutex.RUnlock()
+
+		if exists && time.Now().Before(expiry) {
 			log.Printf("Cookie is valid and not expired")
 			return true
 		} else {
@@ -194,7 +204,13 @@ func isAuthenticated(r *http.Request) bool {
 	if authHeader != "" {
 		log.Printf("Found Authorization header: %s", authHeader)
 		token := strings.TrimPrefix(authHeader, "Bearer ")
-		if expiry, exists := sessions[token]; exists && time.Now().Before(expiry) {
+
+		// Use read lock for checking session
+		sessionMutex.RLock()
+		expiry, exists := sessions[token]
+		sessionMutex.RUnlock()
+
+		if exists && time.Now().Before(expiry) {
 			log.Printf("Bearer token is valid and not expired")
 			return true
 		} else {
@@ -210,6 +226,9 @@ func isAuthenticated(r *http.Request) bool {
 
 // Clean up expired sessions
 func cleanupSessions() {
+	sessionMutex.Lock()
+	defer sessionMutex.Unlock()
+
 	for token, expiry := range sessions {
 		if time.Now().After(expiry) {
 			delete(sessions, token)
