@@ -44,6 +44,7 @@ func setCORSHeaders(w http.ResponseWriter, r *http.Request) {
 	allowedOrigins := []string{
 		"https://0x.reyes.github.io",
 		"http://localhost:3000",
+		"https://localhost:3000",
 		"http://localhost:3001",
 		"http://localhost:8080",
 		"http://127.0.0.1:3000",
