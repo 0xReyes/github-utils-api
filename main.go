@@ -18,29 +18,76 @@ import (
 var sessions = make(map[string]time.Time)
 var sessionMutex sync.RWMutex
 
+// AuthResponse defines the structure for JSON authentication responses.
 type AuthResponse struct {
 	Success bool   `json:"success"`
 	Message string `json:"message"`
 	Token   string `json:"token,omitempty"`
 }
 
+// writeJSONError is a helper to send consistent JSON-formatted error messages.
+func writeJSONError(w http.ResponseWriter, message string, statusCode int) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(statusCode)
+	json.NewEncoder(w).Encode(AuthResponse{
+		Success: false,
+		Message: message,
+	})
+}
+
 func main() {
+	// FIX: Run session cleanup in a single, periodic background goroutine
+	go startSessionCleanup()
+
 	http.HandleFunc("/auth/login", loginHandler)
 	http.HandleFunc("/auth/verify", verifyHandler)
 	http.HandleFunc("/", corsAnywhereHandler)
 
-	log.Println("Starting authenticated proxy server on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	log.Printf("Starting authenticated proxy server on :%s", port)
+	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
-// Generate secure session token
+func startSessionCleanup() {
+
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		cleanupSessions()
+	}
+}
+
+func cleanupSessions() {
+	sessionMutex.Lock()
+	defer sessionMutex.Unlock()
+
+	deletedCount := 0
+	for token, expiry := range sessions {
+		if time.Now().After(expiry) {
+			delete(sessions, token)
+			deletedCount++
+		}
+	}
+	if deletedCount > 0 {
+		log.Printf("Cleaned up %d expired session(s)", deletedCount)
+	}
+}
+
 func generateSessionToken() string {
 	bytes := make([]byte, 32)
-	rand.Read(bytes)
+	if _, err := rand.Read(bytes); err != nil {
+
+		log.Printf("FATAL: crypto/rand.Read failed: %v. Server cannot generate secure tokens.", err)
+
+	}
 	return hex.EncodeToString(bytes)
 }
 
-// Set CORS headers
 func setCORSHeaders(w http.ResponseWriter, r *http.Request) {
 	origin := r.Header.Get("Origin")
 	allowedOrigins := []string{
@@ -65,7 +112,35 @@ func setCORSHeaders(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Credentials", "true")
 }
 
-// Simple login - just generates a token
+func makeCookie(r *http.Request, path string, token string) *http.Cookie {
+	// FIX: The session expiry should match the cookie expiry for consistency.
+	sessionExpiry := time.Now().Add(24 * time.Hour)
+
+	sessionMutex.Lock()
+	sessions[token] = sessionExpiry
+	sessionMutex.Unlock()
+
+	origin := r.Header.Get("Origin")
+	isLocalhost := strings.Contains(origin, "localhost") || strings.Contains(origin, "127.0.0.1")
+
+	cookie := &http.Cookie{
+		Name:     "auth_token",
+		Value:    token,
+		Path:     path,
+		HttpOnly: true,
+		Secure:   !isLocalhost, // Secure should be true for non-localhost environments
+		SameSite: func() http.SameSite {
+			if isLocalhost {
+				return http.SameSiteLaxMode
+			}
+			return http.SameSiteNoneMode
+		}(),
+		Expires: sessionExpiry,
+	}
+	return cookie
+}
+
+// loginHandler handles user login by generating and setting an auth token.
 func loginHandler(w http.ResponseWriter, r *http.Request) {
 	setCORSHeaders(w, r)
 
@@ -75,83 +150,26 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.Method != "POST" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		writeJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-
-	// Generate session token
 	token := generateSessionToken()
 
-	// Store session (expires in 24 hours) with thread safety
-	sessionMutex.Lock()
-	sessions[token] = time.Now().Add(48 * time.Hour)
-	sessionMutex.Unlock()
-
-	// Set HTTP-only cookie with different settings for localhost vs production
-	origin := r.Header.Get("Origin")
-	isLocalhost := strings.Contains(origin, "localhost") || strings.Contains(origin, "127.0.0.1")
-
-	cookie := &http.Cookie{
-		Name:     "auth_token",
-		Value:    token,
-		Domain:   "api.github.com",
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   !isLocalhost, // false for localhost, true for production
-		SameSite: func() http.SameSite {
-			if isLocalhost {
-				return http.SameSiteLaxMode
-			}
-			return http.SameSiteNoneMode
-		}(),
-		Expires: time.Now().Add(24 * time.Hour),
-	}
-
-	cookie2 := &http.Cookie{
-		Name:     "auth_token",
-		Value:    token,
-		Domain:   "raw.githubusercontent.com",
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   !isLocalhost, // false for localhost, true for production
-		SameSite: func() http.SameSite {
-			if isLocalhost {
-				return http.SameSiteLaxMode
-			}
-			return http.SameSiteNoneMode
-		}(),
-		Expires: time.Now().Add(24 * time.Hour),
-	}
-
-	cookie3 := &http.Cookie{
-		Name:     "auth_token",
-		Value:    token,
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   !isLocalhost, // false for localhost, true for production
-		SameSite: func() http.SameSite {
-			if isLocalhost {
-				return http.SameSiteLaxMode
-			}
-			return http.SameSiteNoneMode
-		}(),
-		Expires: time.Now().Add(24 * time.Hour),
-	}
+	// FIX: The cookie path should be "/" to ensure it's sent for all requests
+	cookie := makeCookie(r, "/", token)
 	http.SetCookie(w, cookie)
-	http.SetCookie(w, cookie2)
-	http.SetCookie(w, cookie3)
 
 	response := AuthResponse{
 		Success: true,
 		Message: "Authentication successful",
-		Token:   token,
+		Token:   token, // Including the token in the body is useful for clients that prefer header-based auth.
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 }
 
-// Verify authentication
+// verifyHandler checks if the current request is authenticated.
 func verifyHandler(w http.ResponseWriter, r *http.Request) {
 	setCORSHeaders(w, r)
 
@@ -165,78 +183,57 @@ func verifyHandler(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(response)
 	} else {
-		response := AuthResponse{Success: false, Message: "Not authenticated"}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(response)
+		writeJSONError(w, "Not authenticated", http.StatusUnauthorized)
 	}
 }
 
-// Check if request is authenticated
 func isAuthenticated(r *http.Request) bool {
-	// Debug: Log all cookies
-	log.Printf("Request to %s", r.URL.Path)
-	for _, cookie := range r.Cookies() {
-		log.Printf("Cookie: %s = %s", cookie.Name, cookie.Value)
-	}
+	var token string
 
-	// Check cookie first
 	if cookie, err := r.Cookie("auth_token"); err == nil {
-		log.Printf("Found auth_token cookie: %s", cookie.Value)
-
-		// Use read lock for checking session
-		sessionMutex.RLock()
-		expiry, exists := sessions[cookie.Value]
-		sessionMutex.RUnlock()
-
-		if exists && time.Now().Before(expiry) {
-			log.Printf("Cookie is valid and not expired")
-			return true
-		} else {
-			log.Printf("Cookie is invalid or expired")
-		}
-	} else {
-		log.Printf("No auth_token cookie found: %v", err)
+		token = cookie.Value
 	}
 
-	// Check Authorization header as fallback
-	authHeader := r.Header.Get("Authorization")
-	if authHeader != "" {
-		log.Printf("Found Authorization header: %s", authHeader)
-		token := strings.TrimPrefix(authHeader, "Bearer ")
-
-		// Use read lock for checking session
-		sessionMutex.RLock()
-		expiry, exists := sessions[token]
-		sessionMutex.RUnlock()
-
-		if exists && time.Now().Before(expiry) {
-			log.Printf("Bearer token is valid and not expired")
-			return true
-		} else {
-			log.Printf("Bearer token is invalid or expired")
+	if token == "" {
+		authHeader := r.Header.Get("Authorization")
+		if strings.HasPrefix(authHeader, "Bearer ") {
+			token = strings.TrimPrefix(authHeader, "Bearer ")
 		}
-	} else {
-		log.Printf("No Authorization header found")
 	}
 
-	log.Printf("Authentication failed for request to %s", r.URL.Path)
+	if token == "" {
+		return false // No token found.
+	}
+
+	sessionMutex.RLock()
+	expiry, exists := sessions[token]
+	sessionMutex.RUnlock()
+
+	// Check if the session exists and has not expired.
+	if exists && time.Now().Before(expiry) {
+		log.Printf("Authentication successful for request to %s", r.URL.Path)
+		return true
+	}
+
+	if !exists {
+		log.Printf("Authentication failed: token not found in session store.")
+	} else {
+		log.Printf("Authentication failed: token has expired.")
+	}
+
 	return false
 }
 
-// Clean up expired sessions
-func cleanupSessions() {
-	sessionMutex.Lock()
-	defer sessionMutex.Unlock()
-
-	for token, expiry := range sessions {
-		if time.Now().After(expiry) {
-			delete(sessions, token)
+func isAllowedTarget(targetURL string) bool {
+	allowedSubstrings := []string{"ip-tools", "job-data-warehouse"}
+	for _, sub := range allowedSubstrings {
+		if strings.Contains(targetURL, sub) {
+			return true
 		}
 	}
+	return false
 }
 
-// Modified CORS proxy handler with authentication
 func corsAnywhereHandler(w http.ResponseWriter, r *http.Request) {
 	setCORSHeaders(w, r)
 
@@ -245,72 +242,74 @@ func corsAnywhereHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check authentication for all proxy requests
 	if !isAuthenticated(r) {
-		response := AuthResponse{Success: false, Message: "Authentication required"}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(response)
+		writeJSONError(w, "Authentication required", http.StatusUnauthorized)
 		return
 	}
 
-	// Clean up expired sessions periodically
-	go cleanupSessions()
+	// The path contains the target URL, remove the leading "/"
+	targetURLStr := r.URL.Path[1:]
 
-	targetURL := r.URL.Path[1:] // Remove leading "/"
-	if targetURL == "" {
-		http.Error(w, "Missing target URL", http.StatusBadRequest)
+	// FIX: Forward query parameters from the original request.
+	if r.URL.RawQuery != "" {
+		targetURLStr += "?" + r.URL.RawQuery
+	}
+
+	if targetURLStr == "" {
+		writeJSONError(w, "Missing target URL", http.StatusBadRequest)
 		return
 	}
-	log.Println("targetURL:", targetURL)
 
-	if !strings.HasPrefix(targetURL, "http://") && !strings.HasPrefix(targetURL, "https://") {
-		targetURL = "https://" + targetURL
+	// Prepend scheme if missing.
+	if !strings.HasPrefix(targetURLStr, "http://") && !strings.HasPrefix(targetURLStr, "https://") {
+		targetURLStr = "https://" + targetURLStr
 	}
 
-	parsedURL, err := url.Parse(targetURL)
+	parsedURL, err := url.Parse(targetURLStr)
 	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
-		http.Error(w, "Invalid target URL", http.StatusBadRequest)
+		writeJSONError(w, "Invalid target URL", http.StatusBadRequest)
 		return
 	}
 
-	// Allow ip-tools URLs or the specific job data repository
-	if !strings.Contains(targetURL, "ip-tools") && !strings.Contains(targetURL, "job-data-warehouse") {
-		log.Printf("Forbidden: Target URL '%s' is not allowed", targetURL)
-		http.Error(w, "Access to this target is forbidden.", http.StatusForbidden)
+	// Check if the target is in the allowlist.
+	if !isAllowedTarget(targetURLStr) {
+		log.Printf("Forbidden: Target URL '%s' is not allowed", targetURLStr)
+		writeJSONError(w, "Access to this target is forbidden.", http.StatusForbidden)
 		return
 	}
 
-	req, err := http.NewRequest(r.Method, targetURL, r.Body)
+	// Create a new request to the target URL.
+	req, err := http.NewRequest(r.Method, parsedURL.String(), r.Body)
 	if err != nil {
-		log.Printf("create request to %s failed: %v", targetURL, err)
-		http.Error(w, "Failed to create request", http.StatusInternalServerError)
+		log.Printf("Failed to create request to %s: %v", targetURLStr, err)
+		writeJSONError(w, "Failed to create proxy request", http.StatusInternalServerError)
 		return
 	}
 
+	// Forward essential headers from the original request.
 	forwardedHeaders := []string{
 		"Content-Type",
 		"Accept",
 		"User-Agent",
+		"Accept-Encoding", // FIX: Added Accept-Encoding to allow for compressed responses.
 	}
-
 	for _, key := range forwardedHeaders {
 		if value := r.Header.Get(key); value != "" {
 			req.Header.Set(key, value)
 		}
 	}
 
-	if strings.Contains(parsedURL.Host, "api.github.com") || strings.Contains(parsedURL.Host, "github.com") || strings.Contains(parsedURL.Host, "raw.githubusercontent.com") {
+	if strings.Contains(parsedURL.Host, "github.com") {
 		if token := os.Getenv("GITHUB_TOKEN"); token != "" {
 			req.Header.Set("Authorization", "Bearer "+token)
 		}
 	}
 
-	client := &http.Client{}
+	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("make request to %s failed: %v", targetURL, err)
-		http.Error(w, "Failed to fetch target: "+err.Error(), http.StatusBadGateway)
+		log.Printf("Failed to fetch target %s: %v", targetURLStr, err)
+		writeJSONError(w, "Failed to fetch target URL", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
@@ -325,12 +324,11 @@ func corsAnywhereHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(resp.StatusCode)
-
-	if resp.Body != nil && resp.ContentLength != 0 {
+	if resp.Body != nil {
 		const maxBodySize = 10 * 1024 * 1024 // 10 MB limit
 		_, err = io.Copy(w, io.LimitReader(resp.Body, maxBodySize))
 		if err != nil {
-			log.Printf("Error copying response: %v", err)
+			log.Printf("Error copying response body: %v", err)
 		}
 	}
 }
