@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"io"
@@ -12,17 +13,34 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	_ "github.com/lib/pq" // PostgreSQL driver
 )
 
 // Session store with a mutex for thread safety
 var sessions = make(map[string]time.Time)
 var sessionMutex sync.RWMutex
 
-// AuthResponse defines the structure for JSON authentication responses.
+// Global database connection pool
+var db *sql.DB
+
 type AuthResponse struct {
 	Success bool   `json:"success"`
 	Message string `json:"message"`
 	Token   string `json:"token,omitempty"`
+}
+
+type JobPosting struct {
+	ID             int            `json:"id"`
+	Title          sql.NullString `json:"title"`
+	Link           string         `json:"link"` // Link is a key and should not be null
+	Snippet        sql.NullString `json:"snippet"`
+	DatePosted     sql.NullString `json:"date_posted"`
+	CompanyName    sql.NullString `json:"company_name"`
+	Location       sql.NullString `json:"location"`
+	Description    sql.NullString `json:"description"`
+	EmploymentType sql.NullString `json:"employment_type"`
+	DateUpdated    sql.NullTime   `json:"dateupdated"`
 }
 
 // writeJSONError is a helper to send consistent JSON-formatted error messages.
@@ -35,12 +53,35 @@ func writeJSONError(w http.ResponseWriter, message string, statusCode int) {
 	})
 }
 
+// initDB initializes the database connection
+func initDB() {
+	connStr := os.Getenv("DATABASE_URL")
+	if connStr == "" {
+		log.Fatal("DATABASE_URL environment variable is not set")
+	}
+
+	var err error
+	db, err = sql.Open("postgres", connStr)
+	if err != nil {
+		log.Fatalf("Error opening database: %v", err)
+	}
+
+	err = db.Ping()
+	if err != nil {
+		log.Fatalf("Error connecting to database: %v", err)
+	}
+
+	log.Println("Successfully connected to the database!")
+}
+
 func main() {
+	initDB() // Initialize the database connection
 	// FIX: Run session cleanup in a single, periodic background goroutine
 	go startSessionCleanup()
 
 	http.HandleFunc("/auth/login", loginHandler)
 	http.HandleFunc("/auth/verify", verifyHandler)
+	http.HandleFunc("/jobs", getJobsHandler) // Add route for fetching jobs
 	http.HandleFunc("/", corsAnywhereHandler)
 
 	port := os.Getenv("PORT")
@@ -50,6 +91,48 @@ func main() {
 
 	log.Printf("Starting authenticated proxy server on :%s", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
+}
+
+// getJobsHandler fetches job postings from the database.
+func getJobsHandler(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w, r)
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	// The query remains the same
+	rows, err := db.Query("SELECT id, title, link, snippet, date_posted, company_name, location, description, employment_type, dateupdated FROM job_postings")
+	if err != nil {
+		log.Printf("Error querying database: %v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var jobs []JobPosting
+	for rows.Next() {
+		var job JobPosting
+		// The scan targets are now pointers to fields that can handle NULLs
+		if err := rows.Scan(&job.ID, &job.Title, &job.Link, &job.Snippet, &job.DatePosted, &job.CompanyName, &job.Location, &job.Description, &job.EmploymentType, &job.DateUpdated); err != nil {
+			log.Printf("Error scanning row: %v", err)
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+		jobs = append(jobs, job)
+	}
+
+	if err = rows.Err(); err != nil {
+		log.Printf("Error iterating rows: %v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(jobs); err != nil {
+		log.Printf("Error encoding JSON response: %v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+	}
 }
 
 func startSessionCleanup() {
@@ -225,7 +308,7 @@ func isAuthenticated(r *http.Request) bool {
 }
 
 func isAllowedTarget(targetURL string) bool {
-	allowedSubstrings := []string{"ip-tools", "job-data-warehouse"}
+	allowedSubstrings := []string{"ip-tools"}
 	for _, sub := range allowedSubstrings {
 		if strings.Contains(targetURL, sub) {
 			return true
